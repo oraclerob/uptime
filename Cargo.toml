@@ -1,0 +1,30 @@
+[package]
+name = "uptime"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+winapi = { version = "0.3.9", features = ["fileapi", "handleapi", "ifdef", "ioapiset", "minwindef", "pdh", "psapi", "synchapi", "sysinfoapi", "winbase", "winerror", "winioctl", "winnt", "oleauto", "wbemcli", "rpcdce", "combaseapi", "objidl", "powerbase", "netioapi", "lmcons", "lmaccess", "lmapibuf", "memoryapi", "shellapi", "std"] }
+ntapi = "0.3.7"
+
+[dependencies.windows]
+version = "0.32.0"
+features = [
+    "alloc",
+    "Data_Xml_Dom",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+    "System_Diagnostics",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemServices",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_Power",
+    "Win32_System_Performance",
+    "Win32_System_Diagnostics_Debug",
+]
