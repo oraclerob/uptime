@@ -1,9 +1,0 @@
-.*
-Cargo.lock
-!/target/
-/target/*
-!/target/release/
-/target/release/*
-!/target/release/uptime.exe
-
-
