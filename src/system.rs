@@ -82,7 +82,7 @@ impl SystemInfo for Processor {
                     self.number_processors = po.dwNumberOfProcessors;
                     self.current_mhz = 0_u64;
                 },
-                (None,Some(cm)) => {
+                (None,Some(_)) => {
                     self.number_processors = 0_u32;
                     self.current_mhz = 0_u64;
                 
@@ -198,8 +198,6 @@ unsafe fn get_formatted_counter_value(counter_query: isize) -> f64 {
 
     let display_value = p_value.assume_init();
     let current_value = display_value.Anonymous.doubleValue;
-
-    //println!("{:?}",current_value);
 
     return current_value;
 }
