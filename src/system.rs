@@ -2,6 +2,10 @@ use windows::Win32::Foundation::PSTR;
 use windows::Win32::System::Performance::PdhAddEnglishCounterA;
 use windows::Win32::System::Performance::PdhCloseQuery;
 use windows::Win32::System::Performance::PdhCollectQueryData;
+use windows::Win32::System::Performance::PdhCollectQueryDataEx;
+use windows::Win32::System::Threading::CreateEventA;
+use windows::Win32::System::Threading::WaitForSingleObject;
+use windows::Win32::System::Threading::WAIT_OBJECT_0;
 use windows::Win32::System::Performance::PdhGetFormattedCounterValue;
 use windows::Win32::System::Performance::PdhOpenQueryA;
 use windows::Win32::System::Performance::PdhRemoveCounter;
@@ -15,6 +19,8 @@ use windows::Win32::System::SystemInformation::GetPhysicallyInstalledSystemMemor
 use windows::Win32::System::SystemInformation::GlobalMemoryStatusEx;
 use windows::Win32::System::SystemInformation::GetSystemInfo;
 use windows::Win32::System::SystemInformation::GetTickCount64;
+use windows::Win32::Foundation::BOOL;
+use windows::Win32::Foundation::HANDLE;
 
 
 use ntapi::ntpoapi::PROCESSOR_POWER_INFORMATION;
@@ -22,6 +28,32 @@ use ntapi::ntpoapi::PROCESSOR_POWER_INFORMATION;
 use std::error::Error;
 use std::mem::MaybeUninit;
 use std::mem::{size_of, zeroed};
+
+const FALSE:BOOL = BOOL(0);
+const TRUE:BOOL = BOOL(1);
+const INFINITE: u32 = 4294967295u32;
+
+//Credits to https://github.com/GuillaumeGomez/sysinfo
+// This formula comes from linux's include/linux/sched/loadavg.h
+// https://github.com/torvalds/linux/blob/345671ea0f9258f410eb057b9ced9cefbbe5dc78/include/linux/sched/loadavg.h#L20-L23
+// #[allow(clippy::excessive_precision)]
+// const LOADAVG_FACTOR_1F: f64 = 0.9200444146293232478931553241;
+// #[allow(clippy::excessive_precision)]
+// const LOADAVG_FACTOR_5F: f64 = 0.9834714538216174894737477501;
+// #[allow(clippy::excessive_precision)]
+// const LOADAVG_FACTOR_15F: f64 = 0.9944598480048967508795473394;
+// The time interval in seconds between taking load counts, same as Linux
+
+#[allow(clippy::excessive_precision)]
+const LOADAVG_FACTOR_1F: f64 = 0.9672161004820059020409731093;
+#[allow(clippy::excessive_precision)]
+const LOADAVG_FACTOR_5F: f64 = 0.9933555062550344153694146759;
+#[allow(clippy::excessive_precision)]
+const LOADAVG_FACTOR_15F: f64 = 0.9977802450856064174364805839;
+
+
+
+const SAMPLING_INTERVAL: usize = 5;
 
 #[derive(Default, Debug, Clone)]
 pub(crate) struct Uptime {
@@ -44,8 +76,13 @@ pub(crate) struct Memory {
 #[derive(Default, Debug, Clone)]
 pub(crate) struct Load {
     pub(crate) processor_activity: f64,
-    pub(crate) load: f64,
+    pub(crate) current_load: f64,
+    pub(crate) avg_1_load: f64,
+    pub(crate) avg_5_load: f64,
+    pub(crate) avg_15_load: f64,
 }
+#[derive(Default, Debug, Clone)]
+struct LoadAvg (f64,f64,f64);
 
 #[derive(Default, Debug, Clone)]
 pub(crate) struct Processor {
@@ -93,6 +130,16 @@ impl SystemInfo for Processor {
     }
 }
 
+fn get_load_averages(first_load: f64, second_load: f64) -> (f64,f64,f64) {
+
+
+    let avg_one = (LOADAVG_FACTOR_1F + first_load * (1.0 - LOADAVG_FACTOR_1F)) * (LOADAVG_FACTOR_1F + second_load * (1.0 - LOADAVG_FACTOR_1F));
+    let avg_five = (LOADAVG_FACTOR_5F + first_load * (1.0 - LOADAVG_FACTOR_5F)) * (LOADAVG_FACTOR_5F + second_load * (1.0 - LOADAVG_FACTOR_5F));
+    let avg_fifteen = (LOADAVG_FACTOR_5F + first_load * (1.0 - LOADAVG_FACTOR_5F)) * (LOADAVG_FACTOR_15F + second_load * (1.0 - LOADAVG_FACTOR_15F));
+
+    return(avg_one,avg_five,avg_fifteen)
+}
+
 
 impl SystemInfo for Load {
     fn new() -> Self {
@@ -107,8 +154,12 @@ impl SystemInfo for Load {
             };
 
             match get_load_activity() {
-                Ok(la) => self.load = la,
-                Err(_) => self.load = 0_f64,
+                Ok(loadnow) => {
+                    //Of the 2 load queries 5 seconds apart this is the most recent
+                    self.current_load = loadnow[1];
+                    (self.avg_1_load,self.avg_5_load,self.avg_15_load) = get_load_averages(loadnow[0],loadnow[1]);
+                },
+                Err(_) => self.current_load = 0_f64,
             };
         }
         return self;
@@ -161,8 +212,13 @@ unsafe fn add_counter(px_query: isize, counter_path: PSTR) -> Option<isize> {
     }
 }
 
-unsafe fn collect_data(px_query: isize) {
-    PdhCollectQueryData(px_query);
+unsafe fn collect_data(px_query: isize,interval: u32) -> HANDLE {
+
+    let event = CreateEventA(std::ptr::null_mut(), FALSE, FALSE, PSTR(b"LoadUpdateEvent\0" as *const u8));
+
+    PdhCollectQueryDataEx(px_query,interval,event);
+
+    return event;
 }
 
 unsafe fn get_processors() -> (Option<SYSTEM_INFO>,Option<Vec<PROCESSOR_POWER_INFORMATION>>) {
@@ -210,9 +266,18 @@ pub unsafe fn get_processor_activity() -> Result<f64, Box<dyn Error>> {
                 PSTR(b"\\Processor(_Total)\\% Processor Time\0" as *const u8),
             ) {
                 Some(proc_query) => {
-                    collect_data(px_query);
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    collect_data(px_query);
+                    let event = collect_data(px_query,1);
+                    let mut val = 0_f64;
+
+                    for i in 0..2 {
+                        let wait_result = WaitForSingleObject(event, INFINITE);
+
+                        if wait_result == WAIT_OBJECT_0
+                        {
+                            val = get_formatted_counter_value(proc_query);
+                        }
+                    }
+                   
                     let val = get_formatted_counter_value(proc_query);
                     PdhRemoveCounter(proc_query);
                     PdhCloseQuery(px_query as isize);
@@ -225,7 +290,7 @@ pub unsafe fn get_processor_activity() -> Result<f64, Box<dyn Error>> {
     };
 }
 
-pub unsafe fn get_load_activity() -> Result<f64, Box<dyn Error>> {
+pub unsafe fn get_load_activity() -> Result<Vec<f64>, Box<dyn Error>> {
     match open_query() {
         Some(px_query) => {
             match add_counter(
@@ -233,13 +298,26 @@ pub unsafe fn get_load_activity() -> Result<f64, Box<dyn Error>> {
                 PSTR(b"\\System\\Processor Queue Length\0" as *const u8),
             ) {
                 Some(proc_query) => {
-                    collect_data(px_query);
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    collect_data(px_query);
-                    let val = get_formatted_counter_value(proc_query);
+                    let event = collect_data(px_query,2);
+                    let mut val = 0_f64;
+                    let mut val_first = 0_f64;
+                    let mut val_second = 0_f64;
+
+                    for i in 0..2 {
+                        let wait_result = WaitForSingleObject(event, INFINITE);
+
+                        if wait_result == WAIT_OBJECT_0
+                        {
+                            val = get_formatted_counter_value(proc_query);
+                            if i==0 {val_first = val};
+                            if i==1 {val_second = val};
+                        }
+                    }
+                 
+                    let val_second = get_formatted_counter_value(proc_query);
                     PdhRemoveCounter(proc_query);
                     PdhCloseQuery(px_query as isize);
-                    return Ok(val);
+                    return Ok(vec![val_first,val_second]);
                 }
                 None => return return_error("Open query failed", &"PdhAddEnglishCounterA".to_string()),
             };
@@ -264,8 +342,16 @@ impl SystemInfo for Memory {
             GlobalMemoryStatusEx(data_ptr);
             self.installed_ram = m / (1024);
             self.available_memory = (*data_ptr).ullAvailPhys / (1024 * 1024);
-            self.page_file_size = (*data_ptr).ullTotalPageFile / (1024 * 1024) - self.installed_ram;
-            self.available_page = (*data_ptr).ullAvailPageFile / (1024 * 1024) - self.installed_ram;
+            if ((*data_ptr).ullTotalPageFile / (1024 * 1024)) < self.installed_ram {
+                self.page_file_size = ((*data_ptr).ullTotalPageFile / (1024 * 1024))
+            } else {
+                self.page_file_size = (*data_ptr).ullTotalPageFile / (1024 * 1024) - self.installed_ram;
+            }
+            if (*data_ptr).ullAvailPageFile / (1024 * 1024) < self.installed_ram {
+                self.available_page = 0_u64;
+            } else {
+                self.available_page = (*data_ptr).ullAvailPageFile / (1024 * 1024) - self.installed_ram;
+            }
             self.used_page = self.page_file_size - self.available_page;
 
             let mut _power_info: POWER_INFORMATION_LEVEL = zeroed();

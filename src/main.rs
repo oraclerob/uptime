@@ -22,18 +22,23 @@ fn main() {
 
 
     println!(
-        "Uptime: {} Days {} Hours {} Minutes {} Seconds | Load Average: {:.2} Cores {} Activity {:.2}% Current Mhz {}",
-        u.uptime_days, u.uptime_hours, u.uptime_minutes, u.uptime_seconds,ul.load, p.number_processors, ul.processor_activity, p.current_mhz
+        "Uptime: {} Days {} Hours {} Minutes {} Seconds",
+        u.uptime_days, u.uptime_hours, u.uptime_minutes, u.uptime_seconds
+    );
+
+    println!(
+        "Load Average: Current: {:.2} 1 min: {:.2} 5 min: {:.2} 15 min: {:.2} | CPU Usage: {:.2}% | CPU: {} Mhz | CPU Cores: {} ",
+        ul.current_load, ul.avg_1_load,ul.avg_5_load,ul.avg_15_load, ul.processor_activity, p.current_mhz, p.number_processors,
     );
     
-    println!("Installed RAM: {} MB Available RAM: {} MB Total Page : {} MB Available Page : {} MB Used Page: {} MB",
+    println!("Installed RAM: {} MB | Available RAM: {} MB | Total Page : {} MB | Available Page: {} MB | Used Page: {} MB",
             m.installed_ram,m.available_memory,m.page_file_size,m.available_page,m.used_page);
 
     let mut d = Disks::new();
     unsafe {
         for x in d.info() {
             println!(
-                "Drive: {} Type: {:?} Size: {} GB Free: {} GB",
+                "Drive: {} | Type: {:?} | Size: {} GB | Free: {} GB",
                 x.drive, x.drive_type, x.total_gigabytes, x.available_gigabytes
             );
         }
