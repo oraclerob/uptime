@@ -3,6 +3,7 @@ use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Foundation::PSTR;
 use windows::Win32::System::Performance::PdhAddEnglishCounterA;
 use windows::Win32::System::Performance::PdhCloseQuery;
+use windows::Win32::System::Performance::PdhCollectQueryData;
 use windows::Win32::System::Performance::PdhCollectQueryDataEx;
 use windows::Win32::System::Performance::PdhGetFormattedCounterValue;
 use windows::Win32::System::Performance::PdhOpenQueryA;
@@ -26,8 +27,9 @@ use ntapi::ntpoapi::PROCESSOR_POWER_INFORMATION;
 use std::error::Error;
 use std::mem::MaybeUninit;
 use std::mem::{size_of, zeroed};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::sync::Mutex;
 
 const FALSE: BOOL = BOOL(0);
 //const TRUE:BOOL = BOOL(1);
@@ -47,7 +49,6 @@ const INFINITE: u32 = 4294967295u32;
 
 //This is the 2 second average calculations - above are for 5 second intervals
 //Use 2 seconds for now - so the result displays quicker
-const SAMPLING_INTERVAL: u32 = 2;
 #[allow(clippy::excessive_precision)]
 const LOADAVG_FACTOR_1F: f64 = 0.9672161004820059020409731093;
 #[allow(clippy::excessive_precision)]
@@ -73,7 +74,7 @@ pub(crate) struct Memory {
     pub(crate) used_page: u64,
 }
 
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, Copy)]
 pub(crate) struct Load {
     pub(crate) processor_activity: f64,
     pub(crate) current_load: f64,
@@ -116,9 +117,9 @@ impl SystemInfo for Processor {
                     self.number_processors = po.dwNumberOfProcessors;
                     self.current_mhz = 0_u64;
                 }
-                (None, Some(_)) => {
+                (None, Some(cm)) => {
                     self.number_processors = 0_u32;
-                    self.current_mhz = 0_u64;
+                    self.current_mhz = cm[0].CurrentMhz as u64;
                 }
             };
         }
@@ -145,27 +146,56 @@ impl SystemInfo for Load {
     }
 
     fn info(&mut self) -> &mut Self {
+        unsafe {
+            let data = Arc::new(Mutex::new(Load::default()));
+            let (tx, rx): (Sender<Load>, Receiver<Load>) = channel();
+            let (data1, tx1) = (Arc::clone(&data), tx.clone());
+            let (data2, tx2) = (Arc::clone(&data), tx.clone());
 
-        unsafe {    
-            match get_processor_activity() {
-                Ok(pa) => self.processor_activity = pa,
-                Err(_) => self.processor_activity = 0_f64,
-
-            };
-
-            match get_load_activity() {
-                Ok(loadnow) => {
-                    //Of the 2 load queries 5 seconds apart this is the most recent
-                    self.current_load = loadnow[1];
-                    (self.avg_1_load, self.avg_5_load, self.avg_15_load) =
-                        get_load_averages(loadnow[0], loadnow[1]);
-                }
-                Err(_) => self.current_load = 0_f64,
-            };
+            //let start = std::time::Instant::now();
             
-        }
+            let h1 = thread::spawn(move || {
 
-       
+                let mut data1 = data1.lock().unwrap();
+                match get_processor_activity() {
+                    Ok(pa) => data1.processor_activity = pa,
+                    Err(_) => data1.processor_activity = 0_f64,
+                };
+                
+                tx1.send(*data1).unwrap();
+
+            });
+
+            let h2 = thread::spawn(move || {
+                let mut data2 = data2.lock().unwrap();
+                match get_load_activity() {
+                    Ok(loadnow) => {
+                        //Of the 2 load queries 5 seconds apart this is the most recent
+                        data2.current_load = loadnow[1];
+                        (data2.avg_1_load, data2.avg_5_load, data2.avg_15_load) =
+                            get_load_averages(loadnow[0], loadnow[1]);
+                    }
+                    Err(_) => data2.current_load = 0_f64,
+                };
+
+                tx2.send(*data2).unwrap();
+            });
+
+            let _ = h1.join();
+            let _ = h2.join();
+            drop(tx);
+           
+            //Take the last message as this will be populated with all values
+            for ret in rx {
+                self.processor_activity = ret.processor_activity;
+                self.current_load = ret.current_load;
+                self.avg_1_load = ret.avg_1_load;
+                self.avg_5_load = ret.avg_5_load;
+                self.avg_15_load = ret.avg_15_load;
+            }
+
+            //p!(start.elapsed());
+        }
 
         return self;
     }
@@ -217,7 +247,7 @@ unsafe fn add_counter(px_query: isize, counter_path: PSTR) -> Option<isize> {
     }
 }
 
-unsafe fn collect_data(px_query: isize, interval: u32) -> HANDLE {
+unsafe fn collect_data_interval(px_query: isize, interval: u32) -> HANDLE {
     let event = CreateEventA(
         std::ptr::null_mut(),
         FALSE,
@@ -225,11 +255,20 @@ unsafe fn collect_data(px_query: isize, interval: u32) -> HANDLE {
         PSTR(b"LoadUpdateEvent\0" as *const u8),
     );
 
-    let handle = thread::spawn(move || {
-        PdhCollectQueryDataEx(px_query, interval, event);
-    });
+    PdhCollectQueryDataEx(px_query, interval, event);
 
     return event;
+}
+
+unsafe fn collect_data_now(px_query: isize) -> i32 {
+    let _ = CreateEventA(
+        std::ptr::null_mut(),
+        FALSE,
+        FALSE,
+        PSTR(b"LoadUpdateEvent\0" as *const u8),
+    );
+
+    PdhCollectQueryData(px_query)
 }
 
 unsafe fn get_processors() -> (
@@ -275,7 +314,6 @@ unsafe fn get_formatted_counter_value(counter_query: isize) -> f64 {
 }
 
 pub unsafe fn get_processor_activity() -> Result<f64, Box<dyn Error>> {
-    
     match open_query() {
         Some(px_query) => {
             match add_counter(
@@ -283,18 +321,18 @@ pub unsafe fn get_processor_activity() -> Result<f64, Box<dyn Error>> {
                 PSTR(b"\\Processor(_Total)\\% Processor Time\0" as *const u8),
             ) {
                 Some(proc_query) => {
-                    let event = collect_data(px_query, 1);
-                    let mut val = 0_f64;
+                    collect_data_now(px_query);
+                    let mut val = get_formatted_counter_value(proc_query);
+
                     //Lets get 2 samples
                     //https://docs.microsoft.com/en-us/windows/win32/api/pdh/nf-pdh-pdhcollectquerydataex
-                    for _i in 0..2 {
-                        let wait_result = WaitForSingleObject(event, INFINITE);
+                    let event = collect_data_interval(px_query, 1);
+                    let wait_result = WaitForSingleObject(event, INFINITE);
 
-                        if wait_result == WAIT_OBJECT_0 {
-                            val = get_formatted_counter_value(proc_query);
-                        }
+                    if wait_result == WAIT_OBJECT_0 {
+                        val = get_formatted_counter_value(proc_query);
                     }
-                   
+
                     PdhRemoveCounter(proc_query);
                     PdhCloseQuery(px_query as isize);
                     return Ok(val);
@@ -306,8 +344,6 @@ pub unsafe fn get_processor_activity() -> Result<f64, Box<dyn Error>> {
         }
         None => return Err("Open Query failed".into()),
     };
-
-    
 }
 
 pub unsafe fn get_load_activity() -> Result<Vec<f64>, Box<dyn Error>> {
@@ -318,24 +354,20 @@ pub unsafe fn get_load_activity() -> Result<Vec<f64>, Box<dyn Error>> {
                 PSTR(b"\\System\\Processor Queue Length\0" as *const u8),
             ) {
                 Some(proc_query) => {
-                    let event = collect_data(px_query, SAMPLING_INTERVAL);
-                    let mut val_first = 0_f64;
                     let mut val_second = 0_f64;
+
+                    collect_data_now(px_query);
+                    let val_first = get_formatted_counter_value(proc_query);
+                    
                     //Lets get 2 samples
                     //https://docs.microsoft.com/en-us/windows/win32/api/pdh/nf-pdh-pdhcollectquerydataex
-                    for _i in 0..2 {
-                        let wait_result = WaitForSingleObject(event, INFINITE);
+                    let event = collect_data_interval(px_query, 2);
+                    let wait_result = WaitForSingleObject(event, INFINITE);
 
-                        if wait_result == WAIT_OBJECT_0 {
-                            if _i == 0 {
-                                val_first = get_formatted_counter_value(proc_query)
-                            };
-                            if _i == 1 {
-                                val_second = get_formatted_counter_value(proc_query)
-                            };
-                        }
+                    if wait_result == WAIT_OBJECT_0 {
+                        val_second = get_formatted_counter_value(proc_query);
                     }
-
+                
                     PdhRemoveCounter(proc_query);
                     PdhCloseQuery(px_query as isize);
                     return Ok(vec![val_first, val_second]);
