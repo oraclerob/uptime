@@ -8,6 +8,8 @@ edition = "2021"
 [dependencies]
 winapi = { version = "0.3.9", features = ["fileapi", "handleapi", "ifdef", "ioapiset", "minwindef", "pdh", "psapi", "synchapi", "sysinfoapi", "winbase", "winerror", "winioctl", "winnt", "oleauto", "wbemcli", "rpcdce", "combaseapi", "objidl", "powerbase", "netioapi", "lmcons", "lmaccess", "lmapibuf", "memoryapi", "shellapi", "std"] }
 ntapi = "0.3.7"
+colored = "2.0.0"
+ansi_term = "0.12.1"
 
 [dependencies.windows]
 version = "0.32.0"
